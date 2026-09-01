@@ -1,0 +1,823 @@
+"""Streamlit dashboard for creator-intel.
+
+    python -m creator_intel dashboard
+    # or: streamlit run dashboard/app.py
+
+Reads the SQLite database read-only, so it is safe to leave open while the
+pipeline is still ingesting.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from creator_intel.analytics.queries import (  # noqa: E402
+    archetype_performance,
+    by_dimension,
+    correlations,
+    exploded,
+    hook_language_table,
+    load_reels,
+    overview,
+    phrase_frequency,
+    search_transcripts,
+)
+from creator_intel.config import settings  # noqa: E402
+
+st.set_page_config(page_title="Creator Intel", page_icon="🎬", layout="wide")
+
+METRIC_LABELS = {
+    "view_count": "views",
+    "like_count": "likes",
+    "comment_count": "comments",
+    "share_count": "shares",
+    "save_count": "saves",
+    "reach_count": "reach",
+    "follows_count": "follows gained",
+    "engagement_rate": "engagement rate",
+}
+
+
+@st.cache_data(ttl=60)
+def _load():
+    return load_reels()
+
+
+def _fmt(value, digits: int = 0) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    if isinstance(value, (int, float)):
+        return f"{value:,.{digits}f}"
+    return str(value)
+
+
+def bar(df: pd.DataFrame, x: str, y: str, *, title: str = "", horizontal: bool = True, color: str = None):
+    if df.empty:
+        st.info("Not enough data yet.")
+        return
+    enc_x, enc_y = (alt.X(f"{y}:Q", title=y), alt.Y(f"{x}:N", sort="-x", title=None)) if horizontal else (
+        alt.X(f"{x}:N", sort="-y", title=None), alt.Y(f"{y}:Q", title=y)
+    )
+    chart = alt.Chart(df).mark_bar(cornerRadius=3).encode(
+        x=enc_x, y=enc_y,
+        color=alt.Color(f"{color}:Q", legend=None, scale=alt.Scale(scheme="reds")) if color else alt.value("#dc2626"),
+        tooltip=list(df.columns),
+    ).properties(height=max(200, 26 * len(df)) if horizontal else 320, title=title)
+    st.altair_chart(chart, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# load + guard
+# ---------------------------------------------------------------------------
+if not settings.db_path.exists():
+    st.error(f"No database at `{settings.db_path}`. Run `python -m creator_intel init` first.")
+    st.stop()
+
+df_all = _load()
+if df_all.empty:
+    st.title("🎬 Creator Intel")
+    st.warning("The database is empty. Run `python -m creator_intel run --limit 5` to archive some Reels.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# sidebar filters
+# ---------------------------------------------------------------------------
+st.sidebar.title("Filters")
+
+# Only offer metrics that actually have data (views/shares/saves appear once
+# an Insights CSV has been imported).
+metric_options = [
+    k for k in METRIC_LABELS if k in df_all.columns and df_all[k].notna().any()
+] or list(METRIC_LABELS)
+metric = st.sidebar.selectbox(
+    "Performance metric", metric_options, format_func=lambda k: METRIC_LABELS[k]
+)
+
+dates = df_all["taken_at"].dropna()
+if not dates.empty:
+    dmin, dmax = dates.min().date(), dates.max().date()
+    date_range = st.sidebar.date_input("Posted between", value=(dmin, dmax), min_value=dmin, max_value=dmax)
+else:
+    date_range = None
+
+
+def _multi(label: str, column: str):
+    if column not in df_all:
+        return []
+    options = sorted(df_all[column].dropna().astype(str).unique())
+    return st.sidebar.multiselect(label, options) if options else []
+
+
+sel_topic = _multi("Topic", "main_topic")
+sel_series = _multi("Series", "series")
+sel_hook = _multi("Hook type", "hook_primary_type")
+sel_mode = _multi("Mode (story/advice/…)", "content_mode")
+sel_category = _multi("Dating category", "dating_category")
+
+min_views = 0
+if df_all["view_count"].notna().any():
+    max_views = int(df_all["view_count"].max())
+    min_views = st.sidebar.slider("Minimum views", 0, max_views, 0, step=max(1, max_views // 100))
+
+df = df_all.copy()
+if date_range and isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+    start, end = pd.Timestamp(date_range[0], tz="UTC"), pd.Timestamp(date_range[1], tz="UTC") + pd.Timedelta(days=1)
+    df = df[(df["taken_at"] >= start) & (df["taken_at"] < end)]
+for column, selection in (
+    ("main_topic", sel_topic), ("series", sel_series), ("hook_primary_type", sel_hook),
+    ("content_mode", sel_mode), ("dating_category", sel_category),
+):
+    if selection:
+        df = df[df[column].astype(str).isin(selection)]
+if min_views:
+    df = df[df["view_count"].fillna(0) >= min_views]
+
+st.sidebar.caption(f"{len(df)} of {len(df_all)} videos match")
+st.sidebar.divider()
+st.sidebar.caption(f"DB: `{settings.db_path}`")
+if st.sidebar.button("Reload data"):
+    st.cache_data.clear()
+    st.rerun()
+
+# ---------------------------------------------------------------------------
+# header
+# ---------------------------------------------------------------------------
+st.title("🎬 Creator Intel")
+stats = overview(df)
+c = st.columns(6)
+c[0].metric("Videos", _fmt(stats["videos"]))
+c[1].metric("Analysed", _fmt(stats.get("analyzed")))
+c[2].metric("Total views", _fmt(stats.get("total_views")))
+c[3].metric("Median views", _fmt(stats.get("median_views")))
+c[4].metric("Topics", _fmt(stats.get("topics")))
+c[5].metric("Minutes archived", _fmt(stats.get("total_minutes"), 1))
+
+if df["view_count"].isna().all():
+    st.info(
+        "No view counts are stored yet. Instagram only exposes view counts for some posts via "
+        "the web interface — topic/hook analysis still works, ranked-by-views does not."
+    )
+
+tabs = st.tabs(
+    ["⭐ Start Here", "🔍 Drill Down", "Hooks", "Videos", "Search", "Reel Detail", "All Tables"]
+)
+
+# ---------------------------------------------------------------------------
+# ⭐ Start Here — the plain-English readout
+# ---------------------------------------------------------------------------
+with tabs[0]:
+    ml = METRIC_LABELS[metric]
+    base_med = df[metric].median()
+
+    st.subheader("What's working for you")
+    st.caption(
+        f"Auto-generated from your library, measured by **{ml}**. "
+        "Change the metric in the left sidebar and these update."
+    )
+
+    insights = []
+    ht = by_dimension(df, "hook_primary_type", metric=metric, min_count=15)
+    if not ht.empty and base_med:
+        top_h = ht.iloc[0]
+        lift = (top_h["median_metric"] - base_med) / base_med * 100
+        insights.append(("✅", f"Your best opener is **{str(top_h['hook_primary_type']).replace('_',' ')}** hooks — "
+                         f"median {_fmt(top_h['median_metric'])} {ml} across {int(top_h['videos'])} videos "
+                         f"({lift:+.0f}% vs your typical video)."))
+        used_counts = df["hook_primary_type"].value_counts()
+        if not used_counts.empty and used_counts.index[0] != top_h["hook_primary_type"]:
+            most_used = used_counts.index[0]
+            mu_row = ht[ht["hook_primary_type"] == most_used]
+            if not mu_row.empty:
+                insights.append(("⚠️", f"But you USE **{str(most_used).replace('_',' ')}** most often "
+                                 f"({int(used_counts.iloc[0])} videos, median {_fmt(mu_row.iloc[0]['median_metric'])}). "
+                                 f"You're defaulting to your second-best weapon."))
+    tp = by_dimension(df, "main_topic", metric=metric, min_count=8)
+    if len(tp) >= 2 and base_med:
+        top_t = tp.iloc[0]
+        lift = (top_t["median_metric"] - base_med) / base_med * 100
+        if lift > 15:
+            insights.append(("✅", f"**{top_t['main_topic']}** is your topic outlier — "
+                             f"median {_fmt(top_t['median_metric'])} {ml} ({lift:+.0f}% vs typical, {int(top_t['videos'])} videos)."))
+    cm = by_dimension(df, "content_mode", metric=metric, min_count=8)
+    if len(cm) >= 2 and base_med:
+        worst = cm.iloc[-1]
+        drop = (worst["median_metric"] - base_med) / base_med * 100
+        if drop < -25:
+            insights.append(("🛑", f"**{str(worst['content_mode']).replace('_',' ').title()}** videos underperform — "
+                             f"median {_fmt(worst['median_metric'])} {ml} ({drop:.0f}% vs typical, {int(worst['videos'])} videos)."))
+    if "follows_count" in df and df["follows_count"].notna().any():
+        top_f = df.sort_values("follows_count", ascending=False).iloc[0]
+        insights.append(("👥", f"Reels have gained you **{_fmt(df['follows_count'].sum())} followers** total. "
+                         f"The single biggest: “{(top_f.get('spoken_0_2') or '')[:60]}…” (+{_fmt(top_f['follows_count'])})."))
+
+    for icon, text in insights[:5]:
+        st.markdown(f"### {icon} {text}" if False else f"{icon} &nbsp; {text}", unsafe_allow_html=True)
+        st.markdown("")
+
+    st.divider()
+    left, right = st.columns(2)
+    with left:
+        st.subheader(f"Median {ml} by topic")
+        if not tp.empty:
+            bar(tp.head(8), "main_topic", "median_metric")
+    with right:
+        st.subheader(f"Median {ml} by hook type")
+        ht_all = by_dimension(df, "hook_primary_type", metric=metric, min_count=5)
+        if not ht_all.empty:
+            bar(ht_all.head(8), "hook_primary_type", "median_metric")
+    st.caption("Want to dig into any bar? That's what the **🔍 Drill Down** tab is for.")
+
+# ---------------------------------------------------------------------------
+# 🔍 Drill Down — the slicer-dicer
+# ---------------------------------------------------------------------------
+with tabs[1]:
+    ml = METRIC_LABELS[metric]
+    DIMS = {
+        "Topic": "main_topic",
+        "Hook type": "hook_primary_type",
+        "Hook structure": "hook_structure",
+        "Format (story/advice/…)": "content_mode",
+        "Series": "series",
+        "Video length": "length_bucket",
+        "Setting": "setting",
+        "Speaking pace": "speaking_pace",
+    }
+    DIMS = {k: v for k, v in DIMS.items() if v in df.columns and df[v].notna().any()}
+
+    dim_label = st.radio("Slice your library by:", list(DIMS), horizontal=True, key="drill_dim")
+    dim = DIMS[dim_label]
+
+    grouped = by_dimension(df, dim, metric=metric, min_count=2)
+    if grouped.empty:
+        st.info("Not enough data for this slice yet.")
+    else:
+        grouped = grouped.head(20)
+        sel = alt.selection_point(fields=[dim], name="picked")
+        chart = (
+            alt.Chart(grouped)
+            .mark_bar(cornerRadius=3, cursor="pointer")
+            .encode(
+                x=alt.X("median_metric:Q", title=f"median {ml}"),
+                y=alt.Y(f"{dim}:N", sort="-x", title=None),
+                color=alt.condition(sel, alt.value("#b8860b"), alt.value("#dc2626")),
+                tooltip=[dim, "videos", "median_metric", "vs_median_pct"],
+            )
+            .add_params(sel)
+            .properties(height=max(220, 30 * len(grouped)))
+        )
+        st.caption("**Click a bar** to drill into that slice.")
+        event = st.altair_chart(chart, use_container_width=True, on_select="rerun", key=f"drill_{dim}_{metric}")
+
+        picked = None
+        try:
+            pts = event.selection.picked  # type: ignore[union-attr]
+            if pts:
+                picked = pts[0].get(dim)
+        except Exception:
+            picked = None
+        options = ["(click a bar above, or pick here)"] + grouped[dim].astype(str).tolist()
+        fallback = st.selectbox("Drill into:", options, key=f"drillsel_{dim}")
+        if picked is None and fallback != options[0]:
+            picked = fallback
+
+        if picked:
+            seg = df[df[dim].astype(str) == str(picked)]
+            st.divider()
+            st.subheader(f"🔬 {picked}")
+            base_med = df[metric].median()
+            seg_med = seg[metric].median()
+            k = st.columns(4)
+            k[0].metric("Videos", len(seg))
+            delta = f"{(seg_med - base_med) / base_med * 100:+.0f}% vs typical" if base_med and pd.notna(seg_med) else None
+            k[1].metric(f"Median {ml}", _fmt(seg_med), delta)
+            if "share_count" in seg and seg["share_count"].notna().any():
+                k[2].metric("Median shares", _fmt(seg["share_count"].median()))
+            if "follows_count" in seg and seg["follows_count"].notna().any():
+                k[3].metric("Followers gained", _fmt(seg["follows_count"].sum()))
+
+            cc_label = st.selectbox(
+                "Now break this slice down by:",
+                [l for l in DIMS if l != dim_label],
+                key=f"cross_{dim}",
+            )
+            cross = by_dimension(seg, DIMS[cc_label], metric=metric, min_count=1)
+            if not cross.empty and len(cross) > 1:
+                bar(cross.head(10), DIMS[cc_label], "median_metric",
+                    title=f"{picked} × {cc_label.lower()} — median {ml}")
+            else:
+                st.caption("This slice doesn't split further on that dimension.")
+
+            st.markdown(f"##### The videos in “{picked}” (best first)")
+            seg_show = seg.sort_values(metric, ascending=False, na_position="last")
+            cols = [c for c in ["shortcode", "url", metric, "share_count", "follows_count",
+                                "spoken_0_2", "onscreen_hook", "main_topic", "taken_at_utc"] if c in seg_show.columns]
+            st.dataframe(
+                seg_show[cols], use_container_width=True, hide_index=True, height=380,
+                column_config={"url": st.column_config.LinkColumn("url", display_text="open")},
+            )
+            st.caption("Copy a shortcode into the **Reel Detail** tab for the full forensics of any one video.")
+
+
+# ---------------------------------------------------------------------------
+# Overview
+# ---------------------------------------------------------------------------
+with tabs[6]:
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Posting cadence")
+        cadence = df.dropna(subset=["taken_at"]).copy()
+        if not cadence.empty:
+            cadence["month"] = cadence["taken_at"].dt.to_period("M").dt.to_timestamp()
+            monthly = cadence.groupby("month").agg(videos=("shortcode", "count"),
+                                                   median_metric=(metric, "median")).reset_index()
+            st.altair_chart(
+                alt.Chart(monthly).mark_bar(color="#dc2626").encode(
+                    x=alt.X("month:T", title=None), y=alt.Y("videos:Q", title="videos"),
+                    tooltip=["month:T", "videos:Q", "median_metric:Q"],
+                ).properties(height=280),
+                use_container_width=True,
+            )
+    with right:
+        st.subheader(f"{METRIC_LABELS[metric].title()} over time")
+        pts = df.dropna(subset=["taken_at", metric])
+        if not pts.empty:
+            st.altair_chart(
+                alt.Chart(pts).mark_circle(size=90, opacity=0.7, color="#dc2626").encode(
+                    x=alt.X("taken_at:T", title=None), y=alt.Y(f"{metric}:Q", title=METRIC_LABELS[metric]),
+                    tooltip=["shortcode", "main_topic", "spoken_0_2", metric],
+                ).properties(height=280),
+                use_container_width=True,
+            )
+        else:
+            st.info("No performance data available for this metric.")
+
+    st.subheader("What correlates with performance")
+    st.caption(
+        "Spearman rank correlation between raw measurements and "
+        f"{METRIC_LABELS[metric]}. Rank-based because view counts are heavily skewed. "
+        "Correlation is not causation, and small libraries produce noisy numbers."
+    )
+    corr = correlations(df, target=metric)
+    if corr.empty:
+        st.info("Needs at least ~5 videos with the metric present.")
+    else:
+        st.dataframe(corr, use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# Topics & Series
+# ---------------------------------------------------------------------------
+with tabs[6]:
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.subheader("Videos by topic")
+        topics = by_dimension(df, "main_topic", metric=metric)
+        bar(topics.head(25), "main_topic", "videos")
+    with col_b:
+        st.subheader(f"Median {METRIC_LABELS[metric]} by topic")
+        st.caption("Highest-performing topics. `vs_median_pct` compares against your overall median.")
+        if not topics.empty:
+            st.dataframe(
+                topics[["main_topic", "videos", "median_metric", "mean_metric", "max_metric", "vs_median_pct"]],
+                use_container_width=True, hide_index=True,
+            )
+
+    st.divider()
+    col_c, col_d = st.columns(2)
+    with col_c:
+        st.subheader("Recurring series")
+        series = by_dimension(df, "series", metric=metric)
+        if series.empty:
+            st.info("No recurring series identified yet.")
+        else:
+            st.dataframe(series, use_container_width=True, hide_index=True)
+    with col_d:
+        st.subheader("Story vs advice vs rant vs sales")
+        modes = by_dimension(df, "content_mode", metric=metric)
+        if modes.empty:
+            st.info("Run `analyze` to populate this.")
+        else:
+            st.dataframe(modes, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("People & archetypes mentioned")
+    st.caption(
+        'This is the "do my lawyer videos outperform?" table — grouped by the archetypes '
+        "the AI found mentioned, with the median performance of each group."
+    )
+    arche = archetype_performance(df, min_count=1)
+    if arche.empty:
+        st.info("No archetypes extracted yet.")
+    else:
+        st.dataframe(arche, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Dating categories")
+    cats = by_dimension(df, "dating_category", metric=metric)
+    if not cats.empty:
+        st.dataframe(cats, use_container_width=True, hide_index=True)
+
+    st.subheader("What to make next")
+    st.caption("Follow-up ideas the model proposed, from your highest-performing videos.")
+    ideas = []
+    top = df.dropna(subset=[metric]).sort_values(metric, ascending=False).head(15)
+    for _, row in top.iterrows():
+        payload = row.get("classification_json")
+        if not payload:
+            continue
+        try:
+            data = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for idea in data.get("next_video_ideas") or []:
+            ideas.append({"idea": idea, "from": row["shortcode"], METRIC_LABELS[metric]: row.get(metric),
+                          "topic": row.get("main_topic")})
+    if ideas:
+        st.dataframe(pd.DataFrame(ideas), use_container_width=True, hide_index=True)
+    else:
+        st.info("Run `analyze` to generate follow-up ideas.")
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+HOOK_MEANINGS = {
+    "curiosity": "opens a loop — you have to keep watching to find out",
+    "secret": "promises insider info most people don't know",
+    "warning": "tells you to stop doing something / danger ahead",
+    "controversial_claim": "says something people will argue about",
+    "negative_claim": "leads with what's wrong or doesn't work",
+    "demographic_callout": "names exactly who it's for ('YC founders…')",
+    "direct_address": "talks straight at YOU ('Guys, …')",
+    "command": "orders the viewer to do something",
+    "promise": "guarantees a result if you keep watching",
+    "list": "counts things ('3 ways to…')",
+    "story_opening": "drops you into a story mid-action",
+    "question": "opens by asking you something",
+    "confession": "admits something personal",
+    "authority_claim": "leads with credentials or experience",
+    "wait_until_the_end": "tells you the payoff is at the end",
+    "the_last_one_is_best": "'the last one is the best'",
+    "manipulative_framing": "frames the content as manipulation/taboo",
+    "shocking_framing": "deliberately shocking angle",
+    "specific_person_or_profession": "about a specific type of person (lawyer, ex…)",
+    "archetype_callout": "calls out a dating archetype",
+    "statistic": "opens with a number or stat",
+    "myth_bust": "'everything you know about X is wrong'",
+    "contrarian": "takes the opposite of common advice",
+    "relatable_scenario": "'you know when she…' — a familiar situation",
+    "pattern_interrupt": "something unexpected that stops the scroll",
+    "social_proof": "leans on results or other people's approval",
+    "urgency": "act now / limited time framing",
+    "fear": "leads with fear of loss or failure",
+    "flex": "leads with success/status display",
+}
+
+with tabs[2]:
+    st.subheader("Hook types")
+    st.caption(
+        "How each opening style performs for you. 'Your best example' is the exact "
+        "opening of your highest-viewed video using that hook."
+    )
+    present = df[df["hook_primary_type"].notna()]
+    if present.empty:
+        st.info("Run `analyze` to populate this.")
+    else:
+        rows = []
+        for htype, grp in present.groupby("hook_primary_type"):
+            top = grp.sort_values(metric, ascending=False).iloc[0] if grp[metric].notna().any() else grp.iloc[0]
+            example = top.get("spoken_0_2") or top.get("spoken_first_sentence") or ""
+            rows.append(
+                {
+                    "hook type": str(htype).replace("_", " "),
+                    "what it means": HOOK_MEANINGS.get(str(htype), ""),
+                    "videos": len(grp),
+                    f"median {METRIC_LABELS[metric]}": grp[metric].median(),
+                    "your best example": f"“{example}”" if example else "",
+                    f"its {METRIC_LABELS[metric]}": top.get(metric),
+                }
+            )
+        hook_table_df = pd.DataFrame(rows).sort_values(
+            f"median {METRIC_LABELS[metric]}", ascending=False
+        )
+        st.dataframe(hook_table_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Hook structures")
+    structures = by_dimension(df, "hook_structure", metric=metric)
+    if not structures.empty:
+        st.dataframe(structures, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Exact opening language")
+    st.markdown(
+        "The core table of this project: **verbatim** first words next to performance, so you can compare "
+        "*“Guys, this is super manipulative”* against *“Guys, this is a big secret”* directly — "
+        "not just their shared label."
+    )
+    hook_table = hook_language_table(df, limit=500)
+    show_cols = [c for c in [
+        "shortcode", metric, "spoken_0_2", "spoken_0_5", "onscreen_hook", "hooks_differ",
+        "hook_primary_type", "hook_structure", "time_to_first_word", "words_in_first_2s",
+        "cuts_first_5s", "main_topic",
+    ] if c in hook_table.columns]
+    st.dataframe(hook_table[show_cols], use_container_width=True, hide_index=True, height=420)
+
+    st.divider()
+    col_c, col_d = st.columns(2)
+    with col_c:
+        st.subheader("Spoken vs on-screen hook")
+        st.caption("Does saying one thing while showing another work better for you?")
+        if "hooks_differ" in df:
+            work = df.dropna(subset=["hooks_differ"]).copy()
+            if work.empty:
+                st.info("Run `vision` to detect on-screen text.")
+            else:
+                work["stacked"] = work["hooks_differ"].map({1: "different", 0: "same message"})
+                st.dataframe(by_dimension(work, "stacked", metric=metric), use_container_width=True, hide_index=True)
+    with col_d:
+        st.subheader("Opening pace")
+        st.caption("Words in the first 2 seconds, bucketed.")
+        work = df.dropna(subset=["words_in_first_2s"]).copy()
+        if not work.empty:
+            work["opening_density"] = pd.cut(
+                work["words_in_first_2s"], bins=[-1, 2, 4, 6, 8, 100],
+                labels=["0-2 words", "3-4", "5-6", "7-8", "9+"],
+            ).astype(str)
+            st.dataframe(by_dimension(work, "opening_density", metric=metric), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Recurring phrases & language patterns")
+    phrases = phrase_frequency(df)
+    if phrases.empty:
+        st.info("Run `analyze` to extract notable phrases.")
+    else:
+        st.dataframe(phrases, use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# Visual & Editing
+# ---------------------------------------------------------------------------
+with tabs[6]:
+    st.caption(
+        "All raw measurements. Group counts are small at first — treat these as hypotheses "
+        "to test with more videos, not conclusions."
+    )
+    visual_dims = [
+        ("posture", "Posture"), ("setting", "Indoors / outdoors"), ("shot_type", "Shot type"),
+        ("outfit_formality", "Outfit formality"), ("outfit_category", "Outfit"),
+        ("clothing_color", "Clothing colour"), ("background", "Background"),
+        ("lighting", "Lighting"), ("camera_angle", "Camera angle"), ("hair", "Hair"),
+    ]
+    cols = st.columns(2)
+    for i, (column, label) in enumerate(visual_dims):
+        if column not in df or df[column].dropna().empty:
+            continue
+        with cols[i % 2]:
+            st.subheader(label)
+            st.dataframe(by_dimension(df, column, metric=metric), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Editing")
+    edit_cols = st.columns(2)
+    for i, (column, label) in enumerate(
+        [("speaking_pace", "Speaking pace"), ("length_bucket", "Video length")]
+    ):
+        if column not in df or df[column].dropna().empty:
+            continue
+        with edit_cols[i % 2]:
+            st.markdown(f"**{label}**")
+            st.dataframe(by_dimension(df, column, metric=metric), use_container_width=True, hide_index=True)
+
+    st.subheader("Production elements")
+    st.caption(
+        "How many of your analysed videos use each element. A views comparison only "
+        "appears when you have enough videos on BOTH sides — if nearly everything "
+        "has subtitles, there's nothing to compare against (that's normal)."
+    )
+    element_rows = []
+    for column, label in [
+        ("has_subtitles", "Burned-in subtitles"),
+        ("has_text_overlays", "Text overlays (headlines)"),
+        ("music_detected", "Background music"),
+        ("has_jump_cuts", "Jump cuts"),
+        ("has_zooms", "Zooms"),
+    ]:
+        if column not in df:
+            continue
+        known = df[df[column].notna()]
+        if known.empty:
+            continue
+        with_it = known[known[column] == 1]
+        without = known[known[column] == 0]
+        row = {
+            "element": label,
+            "videos using it": f"{len(with_it)} of {len(known)} ({len(with_it) / len(known) * 100:.0f}%)",
+        }
+        if len(with_it) >= 3 and len(without) >= 3:
+            row[f"median {METRIC_LABELS[metric]} with"] = with_it[metric].median()
+            row[f"median {METRIC_LABELS[metric]} without"] = without[metric].median()
+        else:
+            row[f"median {METRIC_LABELS[metric]} with"] = None
+            row[f"median {METRIC_LABELS[metric]} without"] = None
+        element_rows.append(row)
+    if element_rows:
+        st.dataframe(pd.DataFrame(element_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Run `vision` to populate this.")
+
+# ---------------------------------------------------------------------------
+# Videos
+# ---------------------------------------------------------------------------
+with tabs[3]:
+    st.subheader(f"Ranked by {METRIC_LABELS[metric]}")
+    ranked = df.sort_values(metric, ascending=False, na_position="last")
+    show = [c for c in [
+        "shortcode", "url", "taken_at_utc", metric, "like_count", "comment_count",
+        "duration_sec", "main_topic", "subtopic", "series", "content_mode",
+        "hook_primary_type", "spoken_0_2", "summary",
+    ] if c in ranked.columns]
+    st.dataframe(
+        ranked[show], use_container_width=True, hide_index=True, height=600,
+        column_config={"url": st.column_config.LinkColumn("url", display_text="open")},
+    )
+    st.download_button(
+        "Download this table as CSV",
+        ranked[show].to_csv(index=False).encode("utf-8"),
+        file_name="creator_intel_videos.csv",
+        mime="text/csv",
+    )
+
+# ---------------------------------------------------------------------------
+# Transcript search
+# ---------------------------------------------------------------------------
+with tabs[4]:
+    st.subheader("Searchable transcript archive")
+    st.caption("Full-text search across verbatim transcripts, captions and on-screen text.")
+    query = st.text_input("Search", placeholder='e.g. situationship, "text her back", lawyer')
+    if query:
+        hits = search_transcripts(query, limit=100)
+        if hits.empty:
+            st.info("No matches.")
+        else:
+            merged = hits.merge(
+                df_all[[c for c in ["shortcode", "url", "taken_at_utc", "view_count", "main_topic", "spoken_0_2"]
+                        if c in df_all.columns]],
+                on="shortcode", how="left",
+            )
+            st.write(f"{len(merged)} match(es)")
+            for _, row in merged.iterrows():
+                with st.expander(
+                    f"{row['shortcode']} — {row.get('main_topic') or 'unlabelled'} — "
+                    f"{_fmt(row.get('view_count'))} views"
+                ):
+                    st.markdown(f"**Transcript:** …{row.get('transcript_hit') or ''}…")
+                    if row.get("overlay_hit"):
+                        st.markdown(f"**On screen:** {row['overlay_hit']}")
+                    if row.get("url"):
+                        st.markdown(f"[Open on Instagram]({row['url']})")
+
+    st.divider()
+    st.subheader("Semantic search (creator voice)")
+    st.caption(
+        "Vector search over your own back catalogue. This is the retrieval layer a future "
+        "script generator uses: find your closest past videos, then write in that voice."
+    )
+    idea = st.text_input("Describe an idea", placeholder="e.g. why she went cold after three good dates")
+    top_k = st.slider("How many examples", 5, 50, 20)
+    if idea:
+        try:
+            from creator_intel.db.database import connect
+            from creator_intel.voice.search import semantic_search
+
+            with connect(read_only=True) as conn:
+                matches = semantic_search(conn, idea, k=top_k)
+            if not matches:
+                st.warning("No embeddings stored yet — run `python -m creator_intel embed`.")
+            else:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "similarity": m["similarity"], "shortcode": m["shortcode"],
+                                "views": m.get("view_count"), "topic": m.get("main_topic"),
+                                "hook": m.get("spoken_hook"), "url": m.get("url"),
+                            }
+                            for m in matches
+                        ]
+                    ),
+                    use_container_width=True, hide_index=True,
+                    column_config={"url": st.column_config.LinkColumn("url", display_text="open")},
+                )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Semantic search failed: {exc}")
+
+# ---------------------------------------------------------------------------
+# Reel detail
+# ---------------------------------------------------------------------------
+with tabs[5]:
+    st.subheader("Reel forensics")
+    options = df["shortcode"].tolist()
+    if not options:
+        st.info("No videos match the current filters.")
+    else:
+        pick = st.selectbox("Reel", options, format_func=lambda sc: f"{sc} — {df[df.shortcode == sc]['main_topic'].iloc[0] or '?'}")
+        row = df[df["shortcode"] == pick].iloc[0]
+
+        head = st.columns(4)
+        head[0].metric("Views", _fmt(row.get("view_count")))
+        head[1].metric("Likes", _fmt(row.get("like_count")))
+        head[2].metric("Comments", _fmt(row.get("comment_count")))
+        head[3].metric("Duration", f"{_fmt(row.get('duration_sec'), 1)}s")
+
+        video_col, data_col = st.columns([1, 2])
+        with video_col:
+            path = row.get("local_video_path")
+            if path and Path(path).exists():
+                st.video(path)
+            else:
+                st.info("Video file not found locally.")
+            if row.get("url"):
+                st.markdown(f"[Open on Instagram]({row['url']})")
+
+        with data_col:
+            st.markdown("### RAW — what actually happened")
+            st.markdown(
+                f"""
+| | |
+|---|---|
+| time to first word | `{row.get('time_to_first_word')}` s |
+| spoken 0.0–2.0s | **“{row.get('spoken_0_2') or ''}”** |
+| spoken 0.0–5.0s | “{row.get('spoken_0_5') or ''}” |
+| first sentence | “{row.get('spoken_first_sentence') or ''}” |
+| on-screen 0–5s | **“{row.get('onscreen_0_5') or ''}”** |
+| hooks differ | `{row.get('hooks_differ')}` (similarity {row.get('hook_text_similarity')}) |
+| cuts | {row.get('cut_count')} total, {row.get('cuts_first_5s')} in first 5s |
+| avg shot | {row.get('avg_shot_sec')} s |
+| pace | {row.get('words_per_minute')} wpm ({row.get('speaking_pace')}) |
+| subtitles / overlays / music | {bool(row.get('has_subtitles'))} / {bool(row.get('has_text_overlays'))} / {bool(row.get('music_detected'))} |
+| visual | {row.get('posture')}, {row.get('setting')}, {row.get('shot_type')}, {row.get('outfit_formality')} {row.get('outfit_category')} ({row.get('clothing_color')}), bg {row.get('background')} |
+"""
+            )
+
+            st.markdown("### INTERPRETATION — AI labels")
+            st.markdown(
+                f"**{row.get('main_topic')}** / {row.get('subtopic')} · "
+                f"{row.get('content_mode')} · tone *{row.get('tone')}* · "
+                f"hook **{row.get('hook_primary_type')}** ({row.get('hook_structure')})"
+            )
+            if row.get("summary"):
+                st.write(row["summary"])
+            if row.get("cta"):
+                st.markdown(f"**CTA (verbatim):** “{row['cta']}”")
+
+            payload = row.get("classification_json")
+            if payload:
+                with st.expander("Full classification JSON"):
+                    try:
+                        st.json(json.loads(payload))
+                    except (json.JSONDecodeError, TypeError):
+                        st.code(payload)
+
+        st.divider()
+        col_x, col_y = st.columns(2)
+        with col_x:
+            st.markdown("#### On-screen text detected")
+            from creator_intel.db.database import connect
+
+            with connect(read_only=True) as conn:
+                overlays = pd.DataFrame(
+                    [dict(r) for r in conn.execute(
+                        "SELECT t_start, t_end, text, position, role, is_subtitle, frame_count "
+                        "FROM raw_overlay_text WHERE shortcode = ? ORDER BY t_start", (pick,)
+                    )]
+                )
+            if overlays.empty:
+                st.info("None detected — run `vision`.")
+            else:
+                st.dataframe(overlays, use_container_width=True, hide_index=True)
+
+        with col_y:
+            st.markdown("#### Sampled frames (hook window)")
+            with connect(read_only=True) as conn:
+                frames = [dict(r) for r in conn.execute(
+                    "SELECT t_sec, path FROM raw_frames WHERE shortcode = ? AND phase = 'hook' ORDER BY t_sec",
+                    (pick,)
+                )]
+            existing = [f for f in frames if Path(f["path"]).exists()]
+            if existing:
+                st.image(
+                    [f["path"] for f in existing[:8]],
+                    caption=[f"{f['t_sec']}s" for f in existing[:8]],
+                    width=110,
+                )
+            else:
+                st.info("No frames extracted — run `forensics`.")
+
+        st.markdown("#### Verbatim transcript")
+        st.text_area("transcript", row.get("transcript") or "", height=220, label_visibility="collapsed")
+        with st.expander("Timestamped transcript"):
+            st.code(row.get("transcript_timestamped") or "(none)")
